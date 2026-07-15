@@ -598,16 +598,12 @@ function tick() {
     : scopedResidents.filter((r) => r.online).map((r) => r.id)
   ).filter((id) => id !== backendDrivenResidentId);
 
-  // HOME 실장치가 백엔드 실판정으로 구동 중이면 데모 거주자에게도 무작위 낙상을
-  // 주입하지 않는다. 실데이터 화면에서 가짜 낙상 알람이 실판정과 섞이면 안 된다.
-  const injectMockFalls = !(u?.service === "HOME" && backendDrivenResidentId !== null);
-
   const updated = s.residents.map((r) => {
     if (!activeIds.includes(r.id)) return r;
-    const baseline = 0.3 + Math.random() * 0.5;
+    // 낙상은 난수로 주입하지 않는다. FALL은 백엔드 실판정(applyBackendDetection)
+    // 또는 수동 낙상 시뮬레이션 버튼(simulateFall)으로만 발생한다.
     const cooling = (fallCooldown[r.id] ?? 0) > now;
-    const spike = injectMockFalls && !cooling && Math.random() < 0.006;
-    const mv = spike ? 3.0 + Math.random() * 2.0 : baseline;
+    const mv = 0.3 + Math.random() * 0.5;
     const threshold = r.thresholdOverride ?? s.config.mv_threshold;
     let nextState: StateMachine = r.state;
     const confidence = Math.min(0.99, mv / (threshold * 1.5));
