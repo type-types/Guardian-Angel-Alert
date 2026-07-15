@@ -33,8 +33,8 @@ export interface LiveSample {
   amp_std: number | null; // 최근 0.5초 진폭 표준편차 (움직임 근사 지표)
   // 낙상 판정 (백엔드 모델 가동 시에만 존재)
   detect_state?: DetectState;
-  proba_fall?: number | null; // 최근 3초 윈도우 낙상 확률 (0.25초 주기 갱신)
-  threshold?: number; // 판정 임계값 (기본 0.468)
+  proba_fall?: number | null; // 3초 윈도우 중앙 시점 낙상 확률, 1.5초 고정 지연 (0.25초 주기 갱신)
+  threshold?: number; // 판정 임계값 (기본: 체크포인트 값 0.5)
   fall_count?: number; // 백엔드 기동 후 낙상 확정 횟수
   last_fall_time?: number | null;
 }

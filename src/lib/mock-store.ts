@@ -544,8 +544,8 @@ export function applyBackendDetection(input: {
       room: target.room,
       timestamp: now,
       confidence,
-      // 확정 근거인 다수결 구간 길이 (5윈도우 x 0.25초 스트라이드)
-      duration: 1.25,
+      // 세그멘테이션 모델의 고정 지연 판정 설계값 (윈도우 중앙 시점, 1.5초 전)
+      duration: 1.5,
       response: "PENDING",
     };
     set((s) => ({
@@ -598,11 +598,15 @@ function tick() {
     : scopedResidents.filter((r) => r.online).map((r) => r.id)
   ).filter((id) => id !== backendDrivenResidentId);
 
+  // HOME 실장치가 백엔드 실판정으로 구동 중이면 데모 거주자에게도 무작위 낙상을
+  // 주입하지 않는다. 실데이터 화면에서 가짜 낙상 알람이 실판정과 섞이면 안 된다.
+  const injectMockFalls = !(u?.service === "HOME" && backendDrivenResidentId !== null);
+
   const updated = s.residents.map((r) => {
     if (!activeIds.includes(r.id)) return r;
     const baseline = 0.3 + Math.random() * 0.5;
     const cooling = (fallCooldown[r.id] ?? 0) > now;
-    const spike = !cooling && Math.random() < 0.006;
+    const spike = injectMockFalls && !cooling && Math.random() < 0.006;
     const mv = spike ? 3.0 + Math.random() * 2.0 : baseline;
     const threshold = r.thresholdOverride ?? s.config.mv_threshold;
     let nextState: StateMachine = r.state;

@@ -23,11 +23,12 @@ python3 -m venv .venv
 ```bash
 .venv/bin/python main.py --no-model            # 추론 없이 수신/스트림만
 .venv/bin/python main.py --device cpu          # 기본 auto (macOS는 MPS 우선)
-.venv/bin/python main.py --threshold 0.468     # 낙상 판정 임계값
-.venv/bin/python main.py --checkpoint path/to/best_model.pt
+.venv/bin/python main.py --threshold 0.5       # 낙상 판정 임계값 (기본: 체크포인트 값 0.5)
+.venv/bin/python main.py --checkpoint path/to/temporal_segmentation_fixed_delay.pt
 ```
 
-체크포인트 기본 경로는 저장소 루트의 Window3BestModelInference/weights/best_model.pt 이다.
+체크포인트 기본 경로는 저장소 루트의
+InhouseSegmentationRealtime/weights/temporal_segmentation_fixed_delay.pt 이다.
 
 ## 푸시 알림 (단계 5, ntfy)
 
@@ -74,17 +75,21 @@ FALL 확정 지점(on_fall 콜백)이다.
 링버퍼 3초 윈도우 -> 균일 그리드 리샘플 (native Hz)
   -> 서브캐리어 30개 선택 -> PCA motion signal
   -> S3 scalogram (224,224) + PCA-ACF (1,128,64)
-  -> DualBranchResNet 추론 (best_model.pt)
-  -> 임계값 0.468 + 인과 다수결(최근 5윈도우) -> IDLE/SUSPECT/FALL/COOLDOWN
+  -> DualBranchTemporalSegmentationModel 추론 (temporal_segmentation_fixed_delay.pt)
+  -> 64-bin 세그멘테이션 확률 -> 윈도우 중앙 확률 선형 보간
+  -> 중앙 확률 >= 0.5 -> IDLE/FALL/COOLDOWN (고정 지연 1.5초)
 ```
 
 - 피처 코드는 ACF_Scalogram_FeatureExtraction(연구단 제공, gitignore)에서 이식했고,
   합성 입력에 대해 원본과 비트 단위 동일 출력을 확인했다.
-- 검증에 쓰인 mode5는 중심 윈도우 기준(미래 2윈도우 필요)이라 실시간에서는
-  인과 다수결로 대체했다. 연구단 권장안 확인 후 조정 여지 있음 (detector.py 참조).
+- 모델과 판정 규칙은 InhouseSegmentationRealtime(연구단 제공, gitignore)의 배포
+  규칙을 따른다. 겹침 평균, 최소 지속시간, 간격 연결, 다수결 필터를 쓰지 않고
+  윈도우 중앙 확률 단독으로 판정한다. 각 판정은 현재 시점이 아니라 1.5초 전
+  시점에 대한 것이다 (윈도우 끝에서 중앙 시점 결과를 공개하는 고정 지연 설계).
+- 이전 분류 모델(best_model.pt)의 인과 다수결 후처리는 제거했다. 교체 근거와
+  비교 분석은 dcos/모델비교_세그멘테이션_전환_v1.0.md 참조.
 - CWT scale 계산(freq_to_scale, 호출당 약 0.5초)은 fs와 윈도우 길이에 결정적이라
   캐시한다. 측정 fs를 0.25Hz 격자로 양자화해 캐시가 적중하게 한다.
-- 실측 지연: 피처 약 27ms + 추론(MPS) 약 15ms = 윈도우당 약 42ms (스트라이드 250ms 이내).
 
 벤치마크:
 
@@ -97,7 +102,7 @@ FALL 확정 지점(on_fall 콜백)이다.
 ```
 backend/
   main.py               FastAPI 앱, 엔드포인트, 탐지 루프와 알림 기동
-  detector.py           0.25초 주기 추론 루프, 상태머신, 인과 다수결
+  detector.py           0.25초 주기 추론 루프, 상태머신 (고정 지연 중앙 판정)
   notifier.py           ntfy 푸시 알림 발송 (전용 스레드, 재시도)
   csi/protocol.py       바이너리 프레임 파서 (매직 0xA55A, 체크섬, 재동기화)
   csi/serial_reader.py  포트 탐지, 921600 연결, 자동 재연결 스레드
@@ -105,12 +110,13 @@ backend/
   features/common.py    S3 scalogram 코어 (원본 amfall_losnlos_common.py 이식)
   features/acf.py       PCA-ACF 계산 (원본 build_losnlos_pca_motion_acf_dataset.py 이식)
   features/realtime.py  실시간 윈도우 -> 모델 입력 피처 래퍼
-  inference/model.py    DualBranchResNet 정의 (체크포인트와 1:1, 구조 변경 금지)
-  inference/engine.py   체크포인트 로드, 정규화, 단일 윈도우 추론
+  inference/model.py    DualBranchTemporalSegmentationModel 정의 (체크포인트와 1:1, 구조 변경 금지)
+  inference/engine.py   체크포인트 로드, 정규화, 64-bin 추론과 중앙 확률 보간
   bench_pipeline.py     파이프라인 지연 벤치마크
 ```
 
 프레임 프로토콜 정의의 원본은 esp32c5/csi_recv/main/app_main.c 이다.
 프로토콜이 바뀌면 csi/protocol.py 의 HEADER_FMT 를 함께 갱신해야 한다.
 피처 파라미터(FeatureConfig)는 학습 설정과 일치해야 하며, 근거는
+InhouseSegmentationRealtime/data/config.json 과
 ACF_Scalogram_FeatureExtraction/README_KO.md 의 모델 호환 설정 표이다.

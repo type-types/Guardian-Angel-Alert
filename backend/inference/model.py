@@ -1,8 +1,12 @@
-"""DualBranchResNet 모델 정의.
+"""DualBranchTemporalSegmentationModel 모델 정의.
 
-Window3BestModelInference/scripts/train_losnlos_resnet18_s3_acf_dual_end2end.py 와
-train_losnlos_resnet18_s3_acf_fusion.py 에서 추론에 필요한 클래스만 이식했다.
+InhouseSegmentationRealtime/model.py 에서 그대로 이식했다.
 체크포인트(state_dict) 키와 1:1 대응해야 하므로 구조 변경 금지.
+
+구조: S3와 PCA-ACF 각각을 ResNet18 인코더에 넣고, layer1~4의 특징
+피라미드를 시간축 1D로 사영한 뒤(branch당 128ch) 두 branch를 결합해
+dilated temporal residual decoder로 3초 윈도우의 64-bin 세그멘테이션
+로짓을 출력한다.
 """
 
 from __future__ import annotations
@@ -53,7 +57,7 @@ class BasicBlock(nn.Module):
 
 
 class ResNetImageEncoder(nn.Module):
-    def __init__(self, backbone: str, embedding_dim: int = 512, dropout: float = 0.2) -> None:
+    def __init__(self, backbone: str, embedding_dim: int, dropout: float) -> None:
         super().__init__()
         if backbone not in RESNET_BLOCKS:
             raise ValueError(f"unsupported backbone={backbone!r}")
@@ -69,6 +73,7 @@ class ResNetImageEncoder(nn.Module):
         self.layer3 = self._make_layer(256, blocks[2], stride=2)
         self.layer4 = self._make_layer(512, blocks[3], stride=2)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        # 세그멘테이션 경로에서는 쓰지 않지만 체크포인트 키 대응을 위해 유지
         self.projection = nn.Sequential(
             nn.Dropout(dropout),
             nn.Linear(512, embedding_dim),
@@ -89,39 +94,105 @@ class ResNetImageEncoder(nn.Module):
             layers.append(BasicBlock(self.inplanes, planes))
         return nn.Sequential(*layers)
 
-    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-        return torch.flatten(self.avgpool(x), 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.projection(self.forward_features(x))
-
-
-class DualBranchResNet(nn.Module):
-    def __init__(self, backbone: str, embedding_dim: int, hidden_dim: int, dropout: float) -> None:
+class TemporalPyramidProjector(nn.Module):
+    def __init__(self, pyramid_channels: int, output_bins: int) -> None:
         super().__init__()
-        self.encoder_a = ResNetImageEncoder(backbone=backbone, embedding_dim=embedding_dim, dropout=dropout)
-        self.encoder_b = ResNetImageEncoder(backbone=backbone, embedding_dim=embedding_dim, dropout=dropout)
-        concat_dim = int(embedding_dim) * 2
-        self.classifier = nn.Sequential(
-            nn.LayerNorm(concat_dim),
-            nn.Linear(concat_dim, hidden_dim),
+        self.output_bins = int(output_bins)
+        self.lateral = nn.ModuleList(
+            [
+                nn.Conv1d(channels, pyramid_channels, kernel_size=1)
+                for channels in (64, 128, 256, 512)
+            ]
+        )
+        total = pyramid_channels * len(self.lateral)
+        self.fuse = nn.Sequential(
+            nn.Conv1d(total, total, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, total),
             nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 2),
         )
 
-    def forward(self, x_a: torch.Tensor, x_b: torch.Tensor, image_size: int) -> dict[str, torch.Tensor]:
-        z_a = self.encoder_a(prepare_resnet_image(x_a, image_size))
-        z_b = self.encoder_b(prepare_resnet_image(x_b, image_size))
-        embedding = torch.cat([z_a, z_b], dim=1)
-        return {
-            "embedding_a": z_a,
-            "embedding_b": z_b,
-            "embedding": embedding,
-            "logits": self.classifier(embedding),
-        }
+    def forward(self, features: list[torch.Tensor]) -> torch.Tensor:
+        projected: list[torch.Tensor] = []
+        for feature, lateral in zip(features, self.lateral, strict=True):
+            temporal = lateral(feature.mean(dim=2))
+            temporal = F.interpolate(
+                temporal, size=self.output_bins, mode="linear", align_corners=False
+            )
+            projected.append(temporal)
+        return self.fuse(torch.cat(projected, dim=1))
+
+
+class TemporalResidualBlock(nn.Module):
+    def __init__(self, channels: int, dilation: int, dropout: float) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv1d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=dilation,
+                dilation=dilation,
+                bias=False,
+            ),
+            nn.GroupNorm(8, channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Conv1d(channels, channels, kernel_size=1, bias=False),
+            nn.GroupNorm(8, channels),
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.relu(x + self.block(x))
+
+
+class DualBranchTemporalSegmentationModel(nn.Module):
+    def __init__(
+        self,
+        backbone: str,
+        embedding_dim: int,
+        source_dropout: float,
+        output_bins: int,
+        pyramid_channels: int,
+        decoder_channels: int,
+        decoder_dilations: list[int],
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.output_bins = int(output_bins)
+        self.encoder_a = ResNetImageEncoder(backbone, embedding_dim, source_dropout)
+        self.encoder_b = ResNetImageEncoder(backbone, embedding_dim, source_dropout)
+        self.pyramid_a = TemporalPyramidProjector(pyramid_channels, output_bins)
+        self.pyramid_b = TemporalPyramidProjector(pyramid_channels, output_bins)
+        branch_channels = pyramid_channels * 4
+        self.decoder_input = nn.Sequential(
+            nn.Conv1d(branch_channels * 2, decoder_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(8, decoder_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+        )
+        self.decoder = nn.Sequential(
+            *[
+                TemporalResidualBlock(decoder_channels, dilation, dropout)
+                for dilation in decoder_dilations
+            ]
+        )
+        self.segmentation_head = nn.Conv1d(decoder_channels, 1, kernel_size=1)
+
+    @staticmethod
+    def feature_pyramid(encoder: ResNetImageEncoder, x: torch.Tensor) -> list[torch.Tensor]:
+        x = encoder.maxpool(encoder.relu(encoder.bn1(encoder.conv1(x))))
+        layer1 = encoder.layer1(x)
+        layer2 = encoder.layer2(layer1)
+        layer3 = encoder.layer3(layer2)
+        layer4 = encoder.layer4(layer3)
+        return [layer1, layer2, layer3, layer4]
+
+    def forward(self, s3: torch.Tensor, acf: torch.Tensor, image_size: int) -> torch.Tensor:
+        s3_image = prepare_resnet_image(s3, image_size)
+        acf_image = prepare_resnet_image(acf, image_size)
+        temporal_a = self.pyramid_a(self.feature_pyramid(self.encoder_a, s3_image))
+        temporal_b = self.pyramid_b(self.feature_pyramid(self.encoder_b, acf_image))
+        fused = self.decoder_input(torch.cat([temporal_a, temporal_b], dim=1))
+        return self.segmentation_head(self.decoder(fused)).squeeze(1)

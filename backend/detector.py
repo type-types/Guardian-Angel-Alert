@@ -1,17 +1,18 @@
 """0.25초 주기 실시간 낙상 탐지 루프.
 
-링버퍼에서 3초 윈도우를 꺼내 피처 추출 + 모델 추론을 수행하고,
-임계값 + 인과 다수결(최근 5윈도우) 후처리로 상태를 판정한다.
+링버퍼에서 3초 윈도우를 꺼내 피처 추출 + 세그멘테이션 모델 추론을 수행하고,
+윈도우 중앙 확률 >= 임계값이면 낙상으로 판정한다 (고정 지연 1.5초).
 
-후처리 주의: 검증에 쓴 mode5는 중심 윈도우 기준(미래 2윈도우 필요)이라
-실시간에서는 확정에 0.5초가 추가된다. 여기서는 최근 5개 raw 판정의
-다수결(인과)을 쓴다. 의미는 근사이며 연구단 권장안 확인 후 조정한다.
+판정 규칙은 InhouseSegmentationRealtime 배포 규칙을 그대로 따른다:
+겹침 평균, 최소 지속시간, 간격 연결, 다수결 필터를 적용하지 않고
+중앙 확률 단독으로 판정한다. 각 tick의 확률은 윈도우 끝(현재) 기준
+1.5초 전 시점에 대한 판정이다.
 
 상태 매핑 (대시보드 도메인 용어와 동일):
-  IDLE(대기)      다수결 음성, raw도 음성
-  SUSPECT(의심)   raw 양성이지만 다수결 미확정
-  FALL(낙상)      다수결 양성 -> 낙상 이벤트 확정
+  IDLE(대기)      중앙 확률 < 임계값
+  FALL(낙상)      중앙 확률 >= 임계값 -> 낙상 이벤트 확정
   COOLDOWN(냉각중) FALL 종료 후 cooldown_seconds 동안 재알람 억제
+  (SUSPECT는 이전 다수결 후처리의 중간 상태였고 현재는 쓰지 않는다)
 """
 
 from __future__ import annotations
@@ -29,8 +30,6 @@ from inference import FallInferenceEngine
 log = logging.getLogger("detector")
 
 STRIDE_SEC = 0.25
-DEFAULT_THRESHOLD = 0.468
-MODE_SIZE = 5
 COOLDOWN_SECONDS = 10.0
 HISTORY_MAXLEN = 240  # 최근 60초 (0.25s x 240)
 
@@ -40,7 +39,7 @@ class FallDetector(threading.Thread):
         self,
         ring: RingBuffer,
         engine: FallInferenceEngine,
-        threshold: float = DEFAULT_THRESHOLD,
+        threshold: float | None = None,
         stride_sec: float = STRIDE_SEC,
         cooldown_seconds: float = COOLDOWN_SECONDS,
         feature_config: FeatureConfig | None = None,
@@ -49,7 +48,8 @@ class FallDetector(threading.Thread):
         super().__init__(daemon=True, name="fall-detector")
         self.ring = ring
         self.engine = engine
-        self.threshold = threshold
+        # 기본 임계값은 체크포인트에 실린 배포 규칙 값 (fixed_delay.default_threshold)
+        self.threshold = engine.default_threshold if threshold is None else threshold
         self.stride_sec = stride_sec
         self.cooldown_seconds = cooldown_seconds
         self.feature_config = feature_config or FeatureConfig()
@@ -58,7 +58,6 @@ class FallDetector(threading.Thread):
 
         self._stop = threading.Event()
         self._lock = threading.Lock()
-        self._recent_preds: deque[int] = deque(maxlen=MODE_SIZE)
         self._history: deque[dict[str, Any]] = deque(maxlen=HISTORY_MAXLEN)
         self._state = "IDLE"
         self._cooldown_until = 0.0
@@ -75,8 +74,8 @@ class FallDetector(threading.Thread):
 
     def run(self) -> None:
         log.info(
-            "detector start: device=%s threshold=%.3f stride=%.2fs mode=causal%d",
-            self.engine.device, self.threshold, self.stride_sec, MODE_SIZE,
+            "detector start: device=%s threshold=%.3f stride=%.2fs postprocess=fixed_delay_center(%.1fs)",
+            self.engine.device, self.threshold, self.stride_sec, self.engine.fixed_delay_seconds,
         )
         next_tick = time.monotonic()
         while not self._stop.is_set():
@@ -110,13 +109,7 @@ class FallDetector(threading.Thread):
 
         raw_pred = int(proba >= self.threshold)
         with self._lock:
-            self._recent_preds.append(raw_pred)
-            majority = (
-                int(sum(self._recent_preds) * 2 > len(self._recent_preds))
-                if len(self._recent_preds) == MODE_SIZE
-                else 0
-            )
-            self._advance_state(raw_pred, majority, proba)
+            self._advance_state(raw_pred, proba)
             self._inference_count += 1
             self._last_error = None
             self._latency_ema_ms = (
@@ -126,9 +119,9 @@ class FallDetector(threading.Thread):
             )
             result = {
                 "t": time.time(),
-                "proba_fall": round(proba, 4),
+                # 새 모델은 비낙상 확률이 1e-5 수준까지 내려가므로 6자리로 남긴다
+                "proba_fall": round(proba, 6),
                 "raw_pred": raw_pred,
-                "majority_pred": majority,
                 "state": self._state,
                 "fs_hz": round(features.fs_hz, 2),
                 "window_samples": features.window_samples,
@@ -143,13 +136,13 @@ class FallDetector(threading.Thread):
         if total_ms > self.stride_sec * 1000.0:
             log.warning("tick %.0fms exceeds stride %.0fms", total_ms, self.stride_sec * 1000.0)
 
-    def _advance_state(self, raw_pred: int, majority: int, proba: float | None = None) -> None:
+    def _advance_state(self, raw_pred: int, proba: float | None = None) -> None:
         now = time.monotonic()
         if self._state == "COOLDOWN":
             if now >= self._cooldown_until:
-                self._state = "FALL" if majority else "SUSPECT" if raw_pred else "IDLE"
+                self._state = "FALL" if raw_pred else "IDLE"
             return
-        if majority:
+        if raw_pred:
             if self._state != "FALL":
                 self._fall_count += 1
                 self._last_fall_time = time.time()
@@ -162,7 +155,7 @@ class FallDetector(threading.Thread):
             self._state = "COOLDOWN"
             self._cooldown_until = now + self.cooldown_seconds
             return
-        self._state = "SUSPECT" if raw_pred else "IDLE"
+        self._state = "IDLE"
 
     def _emit_fall(self, proba: float | None) -> None:
         """FALL 확정 시점 콜백 호출. 콜백 오류가 탐지 루프를 깨지 않게 격리한다."""
@@ -183,9 +176,10 @@ class FallDetector(threading.Thread):
             return {
                 "enabled": True,
                 "device": str(self.engine.device),
-                "checkpoint_epoch": self.engine.epoch,
+                "checkpoint": self.engine.checkpoint_path.name,
                 "threshold": self.threshold,
-                "postprocess": f"causal_mode{MODE_SIZE}",
+                "postprocess": "fixed_delay_center",
+                "fixed_delay_seconds": self.engine.fixed_delay_seconds,
                 "state": self._state,
                 "fall_count": self._fall_count,
                 "last_fall_time": self._last_fall_time,

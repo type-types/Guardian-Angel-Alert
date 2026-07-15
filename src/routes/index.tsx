@@ -183,7 +183,7 @@ function MonitoringPage() {
                 }
                 sub={
                   liveMode && live.last?.proba_fall != null
-                    ? `낙상 확률 ${(live.last.proba_fall * 100).toFixed(1)}% · 3초 윈도우 / 0.25초 주기`
+                    ? `낙상 확률 ${(live.last.proba_fall * 100).toFixed(3)}% (1.5초 전 시점, 0.25초 주기)`
                     : liveMode
                       ? "백엔드가 --no-model로 실행 중이거나 모델 로드 실패"
                       : "백엔드/수신기 연결 후 표시됩니다"
@@ -207,7 +207,7 @@ function MonitoringPage() {
                 }
                 sub={
                   liveMode && live.last?.threshold != null
-                    ? "모델 softmax 확률 기준 · 5윈도우 다수결 확정"
+                    ? "윈도우 중앙 확률 기준 (고정 지연 1.5초, 후처리 없음)"
                     : "전역 설정 (mock)"
                 }
               />

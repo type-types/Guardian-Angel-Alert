@@ -28,7 +28,7 @@ from notifier import DEFAULT_SERVER, NtfyNotifier
 
 WS_PUSH_HZ = 10
 
-ring = RingBuffer(max_seconds=30.0, nominal_hz=200.0)
+ring = RingBuffer(max_seconds=120.0, nominal_hz=200.0)
 reader: SerialReader | None = None
 detector: FallDetector | None = None
 detector_error: str | None = None
@@ -87,6 +87,27 @@ def notify_test() -> dict:
         return {"ok": False, "reason": "ntfy 토픽 미설정 (--ntfy-topic 또는 NTFY_TOPIC)"}
     notifier.notify_test()
     return {"ok": True, "topic": notifier.topic}
+
+
+@app.post("/debug/dump")
+def debug_dump(seconds: float = 60.0) -> dict:
+    """링버퍼 원시 윈도우(시각, 진폭)를 npz로 저장한다. 현장 낙상 테스트 오프라인 분석용."""
+    import numpy as np
+
+    times, amps = ring.window(seconds)
+    if times.size == 0:
+        return {"ok": False, "reason": "no data"}
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent / "dumps" / f"dump_{time.strftime('%Y%m%d_%H%M%S')}.npz"
+    path.parent.mkdir(exist_ok=True)
+    np.savez_compressed(path, times=times, amps=amps)
+    return {
+        "ok": True,
+        "path": str(path),
+        "frames": int(times.size),
+        "span_sec": round(float(times[-1] - times[0]), 2),
+    }
 
 
 @app.get("/monitor/detect")
@@ -174,7 +195,6 @@ def start_notifier(args: argparse.Namespace) -> None:
 def main() -> None:
     global reader
     from inference.engine import DEFAULT_CHECKPOINT
-    from detector import DEFAULT_THRESHOLD
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", default=None, help="시리얼 포트 (기본: 자동 탐지)")
@@ -184,7 +204,12 @@ def main() -> None:
     ap.add_argument("--http-port", type=int, default=8000)
     ap.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT), help="모델 체크포인트 경로")
     ap.add_argument("--device", default="auto", choices=("auto", "cuda", "mps", "cpu"))
-    ap.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
+    ap.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="낙상 판정 임계값 (기본: 체크포인트의 배포 규칙 값, 현재 0.5)",
+    )
     ap.add_argument("--no-model", action="store_true", help="모델 추론 비활성 (수신/스트림만)")
     ap.add_argument(
         "--ntfy-topic",

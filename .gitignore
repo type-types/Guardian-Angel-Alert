@@ -42,7 +42,11 @@ Window3BestModelInference/
 # research feature extraction package (raw CSI -> model input preprocessing)
 ACF_Scalogram_FeatureExtraction/
 
+# improved segmentation model + preprocessing package (weights + validation data)
+InhouseSegmentationRealtime/
+
 # python backend
 backend/.venv/
+backend/dumps/
 __pycache__/
 *.pyc
