@@ -25,6 +25,7 @@ class RingBuffer:
         self._last_raw_ts: int | None = None
         self._ts_offset = 0  # 누적 wrap 보정 (us)
         self.total_frames = 0
+        self.device_resets = 0  # 타임스탬프 리셋(수신기 재부팅) 감지 횟수
         self.max_seconds = max_seconds
 
     def append(self, frame: CsiFrame) -> None:
@@ -34,6 +35,15 @@ class RingBuffer:
                 self._ts_offset += _TS_WRAP
             self._last_raw_ts = raw
             t = (raw + self._ts_offset) / 1e6
+            if self._times and not (self._times[-1] - 0.5 <= t <= self._times[-1] + 60.0):
+                # 장치 재부팅으로 타임스탬프가 리셋됨 (뒤로 점프, 또는 uptime이
+                # 랩 한계를 넘긴 재부팅이 랩으로 오인돼 크게 앞으로 점프).
+                # 이전 epoch 프레임과 섞이면 윈도우가 오염되므로 버퍼를 비운다.
+                self._frames.clear()
+                self._times.clear()
+                self._ts_offset = 0
+                self.device_resets += 1
+                t = raw / 1e6
             self._frames.append(frame)
             self._times.append(t)
             self.total_frames += 1
@@ -51,6 +61,7 @@ class RingBuffer:
                     "last_agc_gain": None,
                     "subcarriers": None,
                     "total_frames": self.total_frames,
+                    "device_resets": self.device_resets,
                 }
             times = self._times
             latest = times[-1]
@@ -67,6 +78,7 @@ class RingBuffer:
                 "last_agc_gain": last.agc_gain,
                 "subcarriers": int(last.csi_len // 2),
                 "total_frames": self.total_frames,
+                "device_resets": self.device_resets,
             }
 
     def window(self, seconds: float) -> tuple[np.ndarray, np.ndarray]:

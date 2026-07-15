@@ -48,5 +48,13 @@ InhouseSegmentationRealtime/
 # python backend
 backend/.venv/
 backend/dumps/
+
+# 2x2 실험 도구와 데이터: 전용 레포로 분리됨
+# https://github.com/type-types/csi-guard-2x2-experiment
+backend/experiments/
+backend/experiment.py
+backend/experiment_report.py
+backend/experiment_server.py
+backend/inference/legacy.py
 __pycache__/
 *.pyc

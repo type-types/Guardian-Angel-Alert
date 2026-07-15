@@ -97,6 +97,19 @@ FALL 확정 지점(on_fall 콜백)이다.
 .venv/bin/python bench_pipeline.py --fs 166.67
 ```
 
+## 2x2 실험 도구 (배치 x 모델)
+
+송수신기 배치(의자 마주보기 / 천장 송신기)별로 낙상을 수행하면서 두 모델
+(신규 세그멘테이션, 구 분류)의 최대 confidence를 측정하는 도구는 전용
+레포로 분리했다 (수집 데이터와 발견 문서 포함):
+
+https://github.com/type-types/csi-guard-2x2-experiment
+
+이 저장소에서는 experiment.py, experiment_server.py, experiment_report.py,
+inference/legacy.py, experiments/ 가 gitignore 처리돼 있다. 로컬에서 실험을
+돌릴 때는 이 폴더에 해당 파일들을 두고 쓰되, 변경분은 전용 레포에 커밋한다.
+실험 서버는 main.py와 같은 시리얼 포트를 쓰므로 동시에 띄우지 않는다.
+
 ## 구조
 
 ```
